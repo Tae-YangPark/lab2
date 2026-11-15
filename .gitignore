@@ -1,0 +1,35 @@
+# Rust build files
+target/
+**/target/
+
+# C build files
+*.o
+*.a
+*.so
+*.out
+*.exe
+
+# Compiled executables
+/file_processing/file_basic
+/file_processing/file_dir
+/recursive_dir/recursive_ls
+/typing_practice/typing_practice
+/process_signal/process_basic
+/process_signal/signal_basic
+/ipc_basic/fifo_basic
+/pipe_chat/pipe_chat
+/message_queue_chat/mq_chat
+/shared_memory_copy/shm_copy
+/dbus_notification/dbus_server
+/dbus_notification/dbus_client
+
+# Generated test files
+/file_processing/sample.txt
+/recursive_dir/test/
+/shared_memory_copy/original.txt
+/shared_memory_copy/copied.txt
+
+# Editor temporary files
+*.swp
+*~
+.vscode/
