@@ -11,8 +11,38 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <signal.h>
+#include <poll.h>
+#include <time.h>
 
 #define MSG_SIZE 256
+
+static volatile sig_atomic_t stop_requested = 0;
+static volatile sig_atomic_t child_exited = 0;
+static pid_t parent_pid;
+static int is_child = 0;
+
+static void handle_signal(int signo) {
+    if (signo == SIGCHLD)
+        child_exited = 1;
+    else
+        stop_requested = 1;
+}
+
+static int peer_exited(void) {
+    return is_child ? getppid() != parent_pid : child_exited != 0;
+}
+
+static int deadline(struct timespec *until) {
+    if (clock_gettime(CLOCK_REALTIME, until) == -1)
+        return -1;
+    until->tv_nsec += 200000000L;
+    if (until->tv_nsec >= 1000000000L) {
+        until->tv_sec++;
+        until->tv_nsec -= 1000000000L;
+    }
+    return 0;
+}
 
 // 사용자 메시지 입력
 static int get_input(const char *prompt, char *buffer) {
@@ -24,15 +54,35 @@ static int get_input(const char *prompt, char *buffer) {
         int too_long = 0;
 
         for (;;) {
+            if (stop_requested || peer_exited())
+                return -2;
+
+            struct pollfd input = { .fd = STDIN_FILENO, .events = POLLIN };
+            int ready = poll(&input, 1, 200);
+            if (ready == -1 && errno == EINTR)
+                continue;
+            if (ready == -1) {
+                perror("poll");
+                return -2;
+            }
+            if (ready == 0)
+                continue;
+            if (stop_requested || peer_exited())
+                return -2;
+
             char ch;
             ssize_t n = read(STDIN_FILENO, &ch, 1);
 
             if (n == -1 && errno == EINTR)
                 continue;
 
-            if (n <= 0) {
-                if (n < 0)
-                    perror("read");
+            if (n < 0) {
+                perror("read");
+                return -2;
+            }
+            if (n == 0) {
+                if (len > 0 && !too_long)
+                    break;
                 return -1;
             }
 
@@ -57,27 +107,43 @@ static int get_input(const char *prompt, char *buffer) {
 
 // 메시지 큐로 전송
 static int send_message(mqd_t queue, const char *message) {
-    while (mq_send(queue, message,
-                   strlen(message) + 1, 0) == -1) {
-        if (errno == EINTR)
+    for (;;) {
+        if (stop_requested || peer_exited())
+            return -1;
+        struct timespec until;
+        if (deadline(&until) == -1)
+            return -1;
+        if (mq_timedsend(queue, message, strlen(message) + 1, 0, &until) == 0)
+            return 0;
+        if (errno == EINTR || errno == ETIMEDOUT)
             continue;
 
         perror("mq_send");
         return -1;
     }
-
-    return 0;
 }
 
 // 메시지 큐에서 수신
 static int receive_message(mqd_t queue, char *buffer) {
     ssize_t n;
 
-    do {
-        n = mq_receive(queue, buffer, MSG_SIZE, NULL);
-    } while (n == -1 && errno == EINTR);
-
-    if (n < 0) {
+    for (;;) {
+        if (stop_requested)
+            return -1;
+        struct timespec until;
+        if (deadline(&until) == -1)
+            return -1;
+        n = mq_timedreceive(queue, buffer, MSG_SIZE, NULL, &until);
+        if (n >= 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        // 상대가 마지막 /quit을 전송한 뒤 종료했을 수 있으므로 먼저 수신한다.
+        if (errno == ETIMEDOUT) {
+            if (peer_exited())
+                return -1;
+            continue;
+        }
         perror("mq_receive");
         return -1;
     }
@@ -89,6 +155,24 @@ static int receive_message(mqd_t queue, char *buffer) {
 int main(void) {
     char to_child_name[64];
     char to_parent_name[64];
+
+    // 큐가 닫힌 표준입력의 fd 0을 재사용하지 않도록 먼저 확인한다.
+    if (fcntl(STDIN_FILENO, F_GETFL) == -1) {
+        perror("stdin");
+        return 1;
+    }
+
+    struct sigaction sa = {0};
+    sa.sa_handler = handle_signal;
+    sa.sa_flags = SA_NOCLDSTOP;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, NULL) == -1 ||
+        sigaction(SIGTERM, &sa, NULL) == -1 ||
+        sigaction(SIGCHLD, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 1;
+    }
+    parent_pid = getpid();
 
     // 고유한 메시지 큐 이름 생성
     snprintf(to_child_name, sizeof(to_child_name),
@@ -124,6 +208,20 @@ int main(void) {
         return 1;
     }
 
+    // 이미 연 큐는 fork로 상속된다. 이름을 일찍 지워 비정상 종료 시 잔존을 줄인다.
+    int unlink_child = mq_unlink(to_child_name);
+    int unlink_parent = mq_unlink(to_parent_name);
+    if (unlink_child == -1 || unlink_parent == -1) {
+        fputs("메시지 큐 이름 삭제 실패\n", stderr);
+        mq_close(to_child);
+        mq_close(to_parent);
+        if (unlink_child == -1)
+            mq_unlink(to_child_name);
+        if (unlink_parent == -1)
+            mq_unlink(to_parent_name);
+        return 1;
+    }
+
     printf("=== POSIX 메시지 큐 텍스트 채팅 ===\n");
     printf("종료하려면 /quit 입력\n");
     fflush(stdout);
@@ -134,8 +232,6 @@ int main(void) {
         perror("fork");
         mq_close(to_child);
         mq_close(to_parent);
-        mq_unlink(to_child_name);
-        mq_unlink(to_parent_name);
         return 1;
     }
 
@@ -143,6 +239,7 @@ int main(void) {
     int error = 0;
 
     if (pid == 0) {
+        is_child = 1;
         // 자식 프로세스
         for (;;) {
             if (receive_message(to_child, message) != 0) {
@@ -155,7 +252,12 @@ int main(void) {
 
             printf("[자식이 받은 메시지] %s\n", message);
 
-            if (get_input("자식> ", message) != 0)
+            int input = get_input("자식> ", message);
+            if (input == -2) {
+                error = 1;
+                break;
+            }
+            if (input == -1)
                 strcpy(message, "/quit");
 
             if (send_message(to_parent, message) != 0) {
@@ -169,12 +271,17 @@ int main(void) {
 
         mq_close(to_child);
         mq_close(to_parent);
-        _exit(error);
+        _exit(error || stop_requested);
     }
 
     // 부모 프로세스
     for (;;) {
-        if (get_input("부모> ", message) != 0)
+        int input = get_input("부모> ", message);
+        if (input == -2) {
+            error = 1;
+            break;
+        }
+        if (input == -1)
             strcpy(message, "/quit");
 
         if (send_message(to_child, message) != 0) {
@@ -198,8 +305,15 @@ int main(void) {
 
     // 자식 프로세스 종료 확인
     int status;
-
-    if (waitpid(pid, &status, 0) == -1) {
+    pid_t waited;
+    if (error || stop_requested)
+        kill(pid, SIGTERM);
+    do {
+        waited = waitpid(pid, &status, 0);
+        if (waited == -1 && errno == EINTR && stop_requested)
+            kill(pid, SIGTERM);
+    } while (waited == -1 && errno == EINTR);
+    if (waited == -1) {
         perror("waitpid");
         error = 1;
     } else if (!WIFEXITED(status) ||
@@ -207,7 +321,7 @@ int main(void) {
         error = 1;
     }
 
-    // 메시지 큐 닫기 및 삭제
+    // 메시지 큐 닫기 (이름은 생성 직후 삭제됨)
     if (mq_close(to_child) == -1) {
         perror("mq_close child");
         error = 1;
@@ -216,16 +330,8 @@ int main(void) {
         perror("mq_close parent");
         error = 1;
     }
-    if (mq_unlink(to_child_name) == -1) {
-        perror("mq_unlink child");
-        error = 1;
-    }
-    if (mq_unlink(to_parent_name) == -1) {
-        perror("mq_unlink parent");
-        error = 1;
-    }
 
-    if (error) {
+    if (error || stop_requested) {
         puts("메시지 큐 채팅 실패");
         return 1;
     }

@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <signal.h>
 
 #define SIZE 256
 
@@ -85,13 +86,23 @@ static int input_message(const char *prompt, char *msg) {
             continue;
         }
 
-        return n > 0 ? 0 : -1;
+        // 0: 입력 성공, 1: 정상 EOF, -1: 읽기 오류
+        return n > 0 ? 0 : (n == 0 ? 1 : -1);
     }
 }
 
 int main(void) {
     int parent_to_child[2];
     int child_to_parent[2];
+
+    // 끊긴 연결은 SIGPIPE 종료 대신 write의 EPIPE로 처리한다.
+    struct sigaction sa = {0};
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPIPE, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 1;
+    }
 
     // 양방향 통신을 위한 파이프 2개 생성
     if (pipe(parent_to_child) == -1) {
@@ -114,10 +125,15 @@ int main(void) {
 
     if (pid < 0) {
         perror("fork");
+        close(parent_to_child[0]);
+        close(parent_to_child[1]);
+        close(child_to_parent[0]);
+        close(child_to_parent[1]);
         return 1;
     }
 
     char msg[SIZE];
+    int error = 0;
 
     if (pid == 0) {
         // 자식 프로세스
@@ -129,19 +145,29 @@ int main(void) {
                 parent_to_child[0], msg, SIZE
             );
 
-            if (n <= 0)
+            if (n <= 0) {
+                if (n < 0)
+                    error = 1;
                 break;
+            }
 
             if (strcmp(msg, "/quit") == 0)
                 break;
 
             printf("[자식이 받은 메시지] %s\n", msg);
 
-            if (input_message("자식> ", msg) < 0)
+            int input = input_message("자식> ", msg);
+            if (input != 0) {
+                if (input < 0)
+                    error = 1;
                 break;
+            }
 
-            if (send_line(child_to_parent[1], msg) < 0)
+            if (send_line(child_to_parent[1], msg) < 0) {
+                perror("send");
+                error = 1;
                 break;
+            }
 
             if (strcmp(msg, "/quit") == 0)
                 break;
@@ -149,7 +175,7 @@ int main(void) {
 
         close(parent_to_child[0]);
         close(child_to_parent[1]);
-        _exit(0);
+        _exit(error);
     }
 
     // 부모 프로세스
@@ -157,11 +183,16 @@ int main(void) {
     close(child_to_parent[1]);
 
     for (;;) {
-        if (input_message("부모> ", msg) < 0)
+        int input = input_message("부모> ", msg);
+        if (input != 0) {
+            if (input < 0)
+                error = 1;
             break;
+        }
 
         if (send_line(parent_to_child[1], msg) < 0) {
             perror("send");
+            error = 1;
             break;
         }
 
@@ -172,8 +203,11 @@ int main(void) {
             child_to_parent[0], msg, SIZE
         );
 
-        if (n <= 0)
+        if (n <= 0) {
+            if (n < 0)
+                error = 1;
             break;
+        }
 
         if (strcmp(msg, "/quit") == 0)
             break;
@@ -184,8 +218,22 @@ int main(void) {
     close(parent_to_child[1]);
     close(child_to_parent[0]);
 
-    if (waitpid(pid, NULL, 0) == -1)
+    int status;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited == -1 && errno == EINTR);
+    if (waited == -1) {
         perror("waitpid");
+        error = 1;
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        error = 1;
+    }
+
+    if (error) {
+        fputs("파이프 채팅 실패\n", stderr);
+        return 1;
+    }
 
     puts("채팅 종료");
 

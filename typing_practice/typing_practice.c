@@ -64,17 +64,34 @@ int main(void) {
 
     for (int i = 0; i < count; i++) {
         printf("문장 %d: %s\n", i + 1, sentences[i]);
-        printf("입력: ");
-        fflush(stdout);
+        for (;;) {
+            printf("입력: ");
+            fflush(stdout);
 
-        // 사용자 문장 입력
-        if (fgets(input, sizeof(input), stdin) == NULL) {
-            printf("\n입력이 종료되었습니다.\n");
-            return 1;
+            if (fgets(input, sizeof(input), stdin) == NULL) {
+                printf("\n입력이 종료되었습니다.\n");
+                return 1;
+            }
+
+            char *newline = strchr(input, '\n');
+            if (newline != NULL) {
+                *newline = '\0';
+                break;
+            }
+
+            // 511바이트 입력 직후의 개행/EOF는 허용한다.
+            int ch = getchar();
+            if (ch == '\n' || (ch == EOF && !ferror(stdin)))
+                break;
+
+            while (ch != '\n' && ch != EOF)
+                ch = getchar();
+            if (ferror(stdin)) {
+                perror("입력");
+                return 1;
+            }
+            puts("입력이 너무 깁니다. 511바이트 이하로 다시 입력하세요.");
         }
-
-        // 개행 문자 제거
-        input[strcspn(input, "\n")] = '\0';
 
         // 편집 거리를 이용한 오타 수 계산
         size_t errors = count_errors(sentences[i], input);
