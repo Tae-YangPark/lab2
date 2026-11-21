@@ -10,6 +10,7 @@ target/
 *.exe
 
 # Compiled executables
+/bin/
 /file_processing/file_basic
 /file_processing/file_dir
 /recursive_dir/recursive_ls

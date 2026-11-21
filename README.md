@@ -8,6 +8,18 @@
 - 개발 언어: C, Rust
 - 개발 도구: GCC, Make, Git, Cargo
 
+### 빌드
+
+Ubuntu에서 D-Bus 실습을 빌드하려면 `sudo apt install libsystemd-dev`를 실행합니다. Rust 실습에는 Rust/Cargo 1.85 이상이 필요합니다.
+Ubuntu 24.04에서 기본 Rust 버전이 낮다면 `sudo apt install rustc-1.85 cargo-1.85`로 설치하고, 빌드 터미널에서 `export RUSTC=rustc-1.85 CARGO=cargo-1.85`를 실행합니다.
+
+| 명령 | 동작 |
+|---|---|
+| `make` | C 실습 전체와 Rust 행렬 프로그램 빌드 |
+| `make c` | C 실습만 빌드 (`bin/<실습 폴더>/<프로그램명>`) |
+| `make rust` | Rust 행렬 프로그램만 빌드 (`rust_matrix/target/debug/rust_matrix`) |
+| `make clean` | C와 Rust 빌드 산출물 정리 |
+
 ## 2. 실습 내용
 
 | 실습 | 폴더 | 구현 내용 |
